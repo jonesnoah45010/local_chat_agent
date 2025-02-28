@@ -1,0 +1,7 @@
+tiktoken
+chromadb
+sentence-transformers
+numpy<2.0
+textsplit
+beautifulsoup4
+requests
