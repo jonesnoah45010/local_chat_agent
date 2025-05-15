@@ -1,11 +1,11 @@
 import requests
 import json
 from local_agent_tools import *
-import tiktoken
 from local_semantic_db import local_semantic_db
 from local_sql_db import local_sql_db
 from basic_web_scraping import basic_web_scrape, contains_url, extract_urls
 import pickle
+import os
 
 
 
@@ -31,15 +31,11 @@ class ollama_chat_agent:
 		self.conversation_history = []
 		self.model=model
 		self.model_encoding=model_encoding
-		self.enc=self.figure_out_model_encoding()
 		self.url=url
 		self.name=name
 		self.context_window_limit=context_window_limit
 		if type(name) is str:
 			self.add_context("Your name is " + self.name)
-		# self.semantic_db = local_semantic_db(persist_directory=str(self.name+"_data"+"/"+self.name+"_semantic_db"), collection_name=str(self.name+"_general"))
-		# self.sql_db = local_sql_db(str(self.name+"_data"+"/"+self.name+"_sql_db"))
-
 		self._initialize_databases()
 
 	def _initialize_databases(self):
@@ -54,23 +50,18 @@ class ollama_chat_agent:
 		self.sql_db = local_sql_db(f"{self.name}_data/{self.name}_sql_db")
 
 
-	def figure_out_model_encoding(self):
-		if type(self.model_encoding) is str:
-			try:
-				return tiktoken.encoding_for_model(self.model_encoding)
-			except:
-				return tiktoken.encoding_for_model("gpt-3.5-turbo")
-		else:
-			try:
-				return tiktoken.encoding_for_model(self.model)
-			except:
-				return tiktoken.encoding_for_model("gpt-3.5-turbo")
-
 	def token_count(self, message):
 		"""
-			returns how many tokens a given message will be counted as for the currently used model
+		Counts the number of words in the message as a simple approximation of token count.
 		"""
-		return len(self.enc.encode(str(message)))
+		if isinstance(message, list):
+			all_text = " ".join([m["content"] for m in message if "content" in m])
+		elif isinstance(message, dict):
+			all_text = message.get("content", "")
+		else:
+			all_text = str(message)
+
+		return len(all_text.strip().split())
 
 	def current_tokens_used(self):
 		"""
@@ -185,46 +176,21 @@ class ollama_chat_agent:
 
 
 
-	def chat(self, message, show=True, stream=True, conversation=True, auto_refresh=True, 
+
+	def chat(self, message, show=False, stream=True, conversation=True, auto_refresh=True, 
 			 show_tokens_left=False, refresh_summary_size=500, refresh_summarize_prompt=None, 
-			 refresh_summary_reference_prompt=None):
-
+			 refresh_summary_reference_prompt=None, speech_ready=False):
 		"""
-		Sends a message to the agent.
-		If show is True, then logging messages and the conversation stream will be printed to the 
-		console. 
-		If conversation is True, then user and agent messages are logged to the conversation_history. 
-		If auto_refresh is True, then the conversationhistory will be summarized and reset to this 
-		summary once the conversation has reached a point where it is about to go out of the 
-		context window limit. 
-			When auto_refresh is enabled the refresh_summary_size determines how large the summary of 
-			the conversation will be once the refresh occurs.
-			refresh_summarize_prompt is optional and can be used as the prompt to be used to execute
-			the summarization.  If left as None, will default to "Summarize the following conversation ... ".
-			refresh_summary_reference_prompt will be the prompt prepended to the conversation_history
-			after the summarization occurs.  If left as None, will default to 
-			"This is a summary of the conversation so far ... "
-		If check_semantic_db is True, then the current message will be contextualized using information found
-		in the semantic database.
-			When check_semantic_db is enabled semantic_top_k will determine how many entries are potentially
-			pulled from the semantic database.  i.e. semantic_top_k=3 means up to 3 results could be pulled.
-			semantic_top_k will default to 1.
-			semantic_where can be set to a condition like {name="bob"} that will be used to filter the 
-			semantic query to the semantic database.  If left as None, no filter will be used.
-			semantic_contextualize_prompt is prepended to the context before it is inserted into the
-			conversation or appended to the message. If left as None, will default to 
-			"This information may be relevent to the conversation ... "
-
+		Main chat method for communicating with the agent.
+		If speech_ready=True and stream=True, the response will be chunked by punctuation boundaries.
 		"""
 
-		# Append user message to conversation history
 		if conversation:
 			self.conversation_history.append({"role": "user", "content": message})
 
 		if show_tokens_left and auto_refresh:
 			print(f"{self.name}: Tokens left until refresh: {self.tokens_left()}")
 
-		# Check if context window is about to be exceeded
 		if auto_refresh and not self.is_within_context_window(current_message=message):
 			if show:
 				print(f"{self.name}: CONTEXT WINDOW LIMIT ABOUT TO GO OUT OF BOUNDS, REFRESHING CONVERSATION")
@@ -232,61 +198,67 @@ class ollama_chat_agent:
 									  summarize_prompt=refresh_summarize_prompt, 
 									  summary_reference_prompt=refresh_summary_reference_prompt)
 
-
-		# Properly format the conversation history for Ollama API
 		payload = {
 			"model": self.model,
-			"messages": self.conversation_history  # Pass full conversation history
+			"messages": self.conversation_history
 		}
-
 		headers = {"Content-Type": "application/json"}
-
-		# Send request to Ollama API
 		response = requests.post(self.url+"/chat", headers=headers, json=payload, stream=stream)
 
-		# return response
-		full_text = ""
-
-		if show:
-			print(self.name +": ", end="")
-		if response.status_code == 200:
-			if stream:
-				# Process each line separately (NDJSON format)
+		if stream:
+			def stream_generator():
+				full_text = ""
+				if show:
+					print(self.name + ": ", end="", flush=True)
 				for chunk in response.iter_lines(decode_unicode=True):
-					# print("STREAM: " + str(chunk))
 					if chunk:
 						try:
-							data = json.loads(chunk)  # Parse each JSON object individually
+							data = json.loads(chunk)
 							content = data.get("message", {}).get("content", "")
 							if content:
 								if show:
-									print(content, end="")
+									print(content, end="", flush=True)
 								full_text += content
-
+								yield content
 						except json.JSONDecodeError:
-							continue  # Skip malformed JSON lines
+							continue
+				if conversation and full_text:
+					self.conversation_history.append({"role": "assistant", "content": full_text})
+
+			# Apply speech chunking if requested
+			if speech_ready:
+				return split_stream_into_speech_chunks(stream_generator())
 			else:
-				# Handle non-streamed response (which is still NDJSON format)
-				try:
-					json_objects = response.text.strip().split("\n")  # Split NDJSON into lines
-					for obj in json_objects:
-						data = json.loads(obj)  # Parse each JSON object
-						content = data.get("message", {}).get("content", "")
-						# print("NO STREAM: " + str(content))
-						if content:
-							full_text += content  # Concatenate response parts
-				except json.JSONDecodeError:
-					print("Error: Could not decode JSON response")
-					full_text = f"Error: Invalid JSON response from Ollama API"
+				return stream_generator()
+
 		else:
-			full_text = f"Error: {response.status_code}, {response.text}"
-		
-		# Append assistant response to conversation history
-		if conversation and full_text != "":
-			self.conversation_history.append({"role": "assistant", "content": full_text})
+			full_text = ""
+			if show:
+				print(self.name + ": ", end="")
+			if response.status_code == 200:
+				try:
+					json_objects = response.text.strip().split("\n")
+					for obj in json_objects:
+						data = json.loads(obj)
+						content = data.get("message", {}).get("content", "")
+						if content:
+							if show:
+								print(content, end="", flush=True)
+							full_text += content
+				except json.JSONDecodeError:
+					full_text = f"Error: Invalid JSON response from Ollama API"
+			else:
+				full_text = f"Error: {response.status_code}, {response.text}"
+
+			if conversation and full_text:
+				self.conversation_history.append({"role": "assistant", "content": full_text})
+			return full_text
 
 
-		return full_text
+	def print_stream(self,s):
+		print(f"{self.name}: ", end="")
+		for chunk in s:
+			print(chunk, end="", flush=True)
 
 
 
@@ -338,6 +310,26 @@ class ollama_chat_agent:
 			return None
 
 
+	def upload_document(self, doc_path, doc_name=None, max_sentences_per_chunk=5, metadata=None):
+		if doc_name is None:
+			doc_name = os.path.basename(doc_path)	
+		with open(doc_path, "r") as file:
+			doc = file.read()
+		if metadata is None:
+			metadata = {"doc_name":doc_name}
+		self.semantic_db.insert_in_chunks(doc, metadata=metadata, max_sentences_per_chunk=max_sentences_per_chunk)
+
+
+	def discuss_document(self, semantic_query, doc_name=None, semantic_where=None, semantic_top_k=5, semantic_contextualize_prompt=None):
+		if semantic_where is None and doc_name is None:
+			raise ValueError("Must include either doc_name or semantic_where")
+		if semantic_where is None and doc_name is not None:
+			semantic_where = {"doc_name":doc_name}
+		self.semantically_contextualize(semantic_query, semantic_top_k=semantic_top_k,
+		 semantic_where=semantic_where,
+		  semantic_contextualize_prompt=semantic_contextualize_prompt)
+
+
 
 
 
@@ -352,9 +344,9 @@ class ollama_chat_agent:
 if __name__ == "__main__":
 	agent = ollama_chat_agent(name="Bob", model="llama3.2")
 	while True:
-		prompt = input("You:\n")
-		response = agent.chat(prompt)
-		print("\n")
+		prompt = input("You: ")
+		response_stream = agent.chat(prompt)
+		agent.print_stream(response_stream)
 		if prompt == "bye":
 			break
 
